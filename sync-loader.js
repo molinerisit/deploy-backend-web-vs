@@ -8,31 +8,37 @@ export function registerSyncRoutes(app) {
 
   import("./sync/sync-router.js")
     .then((mod) => {
-      let exported = mod.default || mod.syncRouter;
+      // aceptamos default, named `syncRouter` o `buildSyncRouter`
+      let exported = mod.default ?? mod.syncRouter ?? mod.buildSyncRouter;
 
       if (!exported) {
-        console.warn("[sync] no se encontró export default ni syncRouter en ./sync/sync-router.js");
+        console.warn("[sync] no se encontró export en ./sync/sync-router.js (default | syncRouter | buildSyncRouter)");
         return;
       }
 
-      // Si exportaron una función que devuelve Router, la invocamos
+      // Si ya es un Router (express.Router()), tiene .stack
+      if (typeof exported === "function" && exported.stack && Array.isArray(exported.stack)) {
+        app.use("/sync", exported);
+        console.log("[sync] rutas /sync habilitadas (router exportado)");
+        return;
+      }
+
+      // Si es fábrica, la invocamos para obtener el Router
       if (typeof exported === "function") {
         try {
-          exported = exported();
+          const built = exported(); // debe devolver express.Router()
+          if (built && typeof built === "function" && built.stack && Array.isArray(built.stack)) {
+            app.use("/sync", built);
+            console.log("[sync] rutas /sync habilitadas (router construido por fábrica)");
+            return;
+          }
         } catch (e) {
-          console.error("[sync] la función exportada no devolvió un Router:", e?.message || e);
+          console.error("[sync] error al invocar la fábrica del router:", e?.message || e);
           return;
         }
       }
 
-      // En este punto esperamos un express.Router()
-      if (!exported || typeof exported !== "function" || !exported.stack) {
-        console.error("[sync] el export no parece un Router de express");
-        return;
-      }
-
-      app.use("/sync", exported);
-      console.log("[sync] rutas /sync habilitadas");
+      console.error("[sync] el módulo no exporta un Router válido.");
     })
     .catch((e) => {
       console.warn("[sync] no se pudo cargar ./sync/sync-router.js:", e?.message || e);
