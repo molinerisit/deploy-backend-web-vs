@@ -7,6 +7,7 @@ import morgan from "morgan";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import { buildStatsRouter } from "./stats-routes.js";
 
 // Sync (loader dinámico, se activa con SYNC_API_ENABLED=1)
 import { registerSyncRoutes } from "./sync-loader.js";
@@ -79,6 +80,7 @@ await sequelize.authenticate().catch((err) => {
 });
 await sequelize.sync();
 console.log("DB lista");
+app.use("/stats", buildStatsRouter());
 
 // Montar rutas de /sync si está habilitado por env
 registerSyncRoutes(app);
