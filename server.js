@@ -7,9 +7,8 @@ import morgan from "morgan";
 import rateLimit from "express-rate-limit";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { buildStatsRouter } from "./stats-routes.js";
 
-// Sync (loader dinámico, se activa con SYNC_API_ENABLED=1)
+import { buildStatsRouter } from "./stats-routes.js";
 import { registerSyncRoutes } from "./sync-loader.js";
 
 import { sequelize, User, License } from "./models.js";
@@ -29,33 +28,15 @@ import { signLicenseJWS, getPublicKeyPem } from "./license-sign.js";
 ========================= */
 const app = express();
 
-// CORS
-const allowOrigins = (process.env.ALLOW_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-app.use(
-  cors({
-    origin: allowOrigins.length ? allowOrigins : true,
-    credentials: true,
-  })
-);
-
-app.use(helmet());
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan("dev"));
-app.set("trust proxy", 1);
-app.use(rateLimit({ windowMs: 60_000, max: 200 }));
-
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+
 const FRONTEND_URL =
   process.env.FRONTEND_URL || process.env.CLIENT_URL || "http://localhost:5173";
-const PUBLIC_RETURN_URL_BASE = process.env.PUBLIC_RETURN_URL_BASE; // ej: https://tu-backend.com
-const WEBHOOK_PUBLIC_URL = process.env.WEBHOOK_PUBLIC_URL; // fallback de base pública
-const SYNC_ENABLED = process.env.SYNC_API_ENABLED === "1";
+const PUBLIC_RETURN_URL_BASE = process.env.PUBLIC_RETURN_URL_BASE || "";
+const WEBHOOK_PUBLIC_URL = process.env.WEBHOOK_PUBLIC_URL || "";
+const SYNC_ENABLED = String(process.env.SYNC_API_ENABLED || "0") === "1";
 
 if (!JWT_SECRET) {
   console.error("Falta JWT_SECRET");
@@ -70,28 +51,100 @@ if (!MP_ACCESS_TOKEN) {
   process.exit(1);
 }
 
-// Inicializar SDK MP (wrapper HTTP en mercadopago.js)
+/* =========================
+   CORS (Vercel + whitelist env)
+========================= */
+function originOf(urlOrOrigin) {
+  try {
+    const u = new URL(urlOrOrigin);
+    return u.origin;
+  } catch {
+    try {
+      const u2 = new URL(
+        urlOrOrigin.includes("://") ? urlOrOrigin : `https://${urlOrOrigin}`
+      );
+      return u2.origin;
+    } catch {
+      return null;
+    }
+  }
+}
+
+const envOrigins = (process.env.ALLOW_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map(originOf)
+  .filter(Boolean);
+
+// origin del FRONTEND_URL principal
+const frontendOrigin = originOf(FRONTEND_URL);
+
+// dominio prod fijo de vercel (ajustá si cambia)
+const vercelProd =
+  frontendOrigin || "https://deploy-frontend-web-vs-goou.vercel.app";
+// previews del mismo proyecto (deploy-frontend-web-vs-goou-*.vercel.app)
+const vercelPreviewRe =
+  /^https:\/\/deploy-frontend-web-vs-goou-[a-z0-9-]+\.vercel\.app$/;
+
+const corsOptions = {
+  origin(origin, cb) {
+    // sin origin (curl/SSR/health) -> permitir
+    if (!origin) return cb(null, true);
+
+    const allowed =
+      origin === vercelProd ||
+      vercelPreviewRe.test(origin) ||
+      envOrigins.includes(origin);
+
+    if (allowed) return cb(null, true);
+
+    console.warn("[CORS] Bloqueado origin:", origin);
+    cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "x-license-token",
+    "x-device-id",
+  ],
+};
+
+// Middlewares base
+app.set("trust proxy", 1);
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
+app.use(morgan("dev"));
+app.use(rateLimit({ windowMs: 60_000, max: 200 }));
+
+// CORS (debe ir después de body parsers para responder preflight en todas)
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+/* =========================
+   MP + DB
+========================= */
 initializeMercadoPago(MP_ACCESS_TOKEN);
 
-// DB
 await sequelize.authenticate().catch((err) => {
   console.error("Error DB:", err);
   process.exit(1);
 });
 await sequelize.sync();
 console.log("DB lista");
-app.use("/stats", buildStatsRouter());
 
-// Montar rutas de /sync si está habilitado por env
-registerSyncRoutes(app);
-
-// JWT
+/* =========================
+   Utilidades
+========================= */
 const signJWT = (u) =>
   jwt.sign({ id: u.id, email: u.email, role: u.role }, JWT_SECRET, {
     expiresIn: "7d",
   });
 
-// Helpers URL
 function ensureAbsoluteUrl(input, fallback = "http://localhost:5173") {
   try {
     return new URL(input).toString();
@@ -115,18 +168,18 @@ function joinUrl(base, segment) {
   return u.toString();
 }
 
-// back_url para Mercado Pago (siempre HTTPS público y sin // dobles)
+// back_url para Mercado Pago (idealmente HTTPS público)
 function computeMpBackUrl() {
   const candidate = PUBLIC_RETURN_URL_BASE
     ? joinUrl(PUBLIC_RETURN_URL_BASE, "return")
     : WEBHOOK_PUBLIC_URL
     ? joinUrl(WEBHOOK_PUBLIC_URL, "return")
-    : joinUrl(FRONTEND_URL, "return"); // último recurso
+    : joinUrl(FRONTEND_URL, "return");
 
   const u = new URL(candidate);
   if (u.protocol !== "https:") {
     console.warn(
-      "[/subscribe] back_url no es https; usado igualmente, MP puede rechazar. value:",
+      "[/subscribe] back_url no es https; MP podría rechazarla:",
       candidate
     );
   }
@@ -141,23 +194,21 @@ function generateLicenseToken() {
     36
   )}`;
 }
-
 function daysLeftFrom(date) {
   if (!date) return null;
   const ms = new Date(date).getTime() - Date.now();
   return Math.ceil(ms / (1000 * 60 * 60 * 24));
 }
-
 function licenseStatusFromRecord(lic) {
-  // Determina estado coherente con expiración y estado guardado
   if (!lic) return null;
   const dLeft = daysLeftFrom(lic.expiresAt);
-  let status = lic.status; // "active" | "inactive" | "paused" | "cancelled" | "expired" | "disabled"
+  let status = lic.status;
   if (dLeft !== null && dLeft < 0) status = "expired";
-  else if (status === "active" && dLeft !== null && dLeft <= 7) status = "warning";
+  else if (status === "active" && dLeft !== null && dLeft <= 7)
+    status = "warning";
 
   return {
-    status, // para el desktop: "active" | "warning" | "expired" | "disabled" (tomamos "cancelled"/"paused" como "disabled" si querés)
+    status,
     message:
       status === "active"
         ? `Licencia activa${dLeft ? ` (${dLeft} días restantes)` : ""}.`
@@ -175,36 +226,19 @@ function licenseStatusFromRecord(lic) {
   };
 }
 
-// HTML fallback para redirección
 function htmlRedirect(targetUrl) {
-  return `
-<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <title>Volviendo al panel…</title>
-  <meta http-equiv="refresh" content="0;url='${targetUrl}'" />
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0f172a; color:#e5e7eb; display:grid; place-items:center; height:100vh; margin:0; }
-    .card { background:#0b1220; border:1px solid #334155; border-radius:12px; padding:20px; max-width:560px; }
-    a { color:#60a5fa; }
-    .small { color:#94a3b8; font-size:12px; margin-top:8px; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Redirigiendo a tu panel…</h1>
-    <p>Si no te lleva automáticamente, hacé clic acá:</p>
-    <p><a href="${targetUrl}">Ir al panel</a></p>
-    <p class="small">Podés copiar y pegar esta URL en tu navegador si fuera necesario:<br/><code>${targetUrl}</code></p>
-  </div>
-</body>
-</html>`.trim();
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"/><title>Volviendo al panel…</title><meta http-equiv="refresh" content="0;url='${targetUrl}'"/><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0f172a;color:#e5e7eb;display:grid;place-items:center;height:100vh;margin:0}.card{background:#0b1220;border:1px solid #334155;border-radius:12px;padding:20px;max-width:560px}a{color:#60a5fa}.small{color:#94a3b8;font-size:12px;margin-top:8px}</style></head><body><div class="card"><h1>Redirigiendo a tu panel…</h1><p>Si no te lleva automáticamente, hacé clic acá:</p><p><a href="${targetUrl}">Ir al panel</a></p><p class="small">Podés copiar y pegar esta URL en tu navegador si fuera necesario:<br/><code>${targetUrl}</code></p></div></body></html>`;
 }
 
 /* =========================
-   Rutas públicas básicas
+   Rutas
 ========================= */
+app.use("/stats", buildStatsRouter());
+
+registerSyncRoutes(app);
+
+const auth = authMiddleware();
+
 app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.post("/register", async (req, res) => {
@@ -249,18 +283,13 @@ app.post("/login", async (req, res) => {
         .json({ error: "Email y contraseña son requeridos." });
 
     const emailNorm = String(email).trim().toLowerCase();
-    const passwordStr = String(password);
-
     const user = await User.findOne({ where: { email: emailNorm } });
-    console.log("[login] email:", emailNorm, "userFound:", !!user);
-
     if (!user)
       return res
         .status(400)
         .json({ error: "Usuario o contraseña incorrectos" });
 
-    const match = await bcrypt.compare(passwordStr, user.passwordHash);
-    console.log("[login] passwordMatch:", match);
+    const match = await bcrypt.compare(String(password), user.passwordHash);
     if (!match)
       return res
         .status(400)
@@ -276,14 +305,7 @@ app.post("/login", async (req, res) => {
   }
 });
 
-/* =========================
-   Auth middleware
-========================= */
-const auth = authMiddleware();
-
-/* =========================
-   Licencias (protegido)
-========================= */
+/* ----- Licencias (protegido) ----- */
 app.get("/license", auth, async (req, res) => {
   try {
     const license = await License.findOne({
@@ -297,7 +319,6 @@ app.get("/license", auth, async (req, res) => {
   }
 });
 
-// Vincular dispositivo a la licencia activa
 app.post("/license/devices/attach", auth, async (req, res) => {
   try {
     const { deviceId } = req.body || {};
@@ -326,7 +347,6 @@ app.post("/license/devices/attach", auth, async (req, res) => {
   }
 });
 
-// Desvincular dispositivo por id
 app.post("/license/devices/detach", auth, async (req, res) => {
   try {
     const { deviceId } = req.body || {};
@@ -341,9 +361,7 @@ app.post("/license/devices/detach", auth, async (req, res) => {
   }
 });
 
-/* =========================
-   Suscripciones (crear)
-========================= */
+/* ----- Suscripciones (crear) ----- */
 app.post("/subscribe", auth, async (req, res) => {
   try {
     const { plan, mpEmail } = req.body || {};
@@ -359,13 +377,6 @@ app.post("/subscribe", auth, async (req, res) => {
     const amount = plan === "multi" ? multi : single;
 
     const backUrl = computeMpBackUrl();
-    console.log("[/subscribe] mpBackUrl:", backUrl, {
-      FRONTEND_URL,
-      PUBLIC_RETURN_URL_BASE,
-      WEBHOOK_PUBLIC_URL,
-      BACKEND_PUBLIC_URL: process.env.BACKEND_PUBLIC_URL,
-    });
-
     const { init_point, mpPreapprovalId } = await createSubscriptionDirect({
       userId: user.id,
       plan,
@@ -402,16 +413,16 @@ app.post("/subscribe", auth, async (req, res) => {
     if (err?.cause)
       console.error("MP cause:", JSON.stringify(err.cause, null, 2));
     const status = Number(err?.status) || 500;
-    res.status(status >= 400 && status < 600 ? status : 500).json({
-      error: "No se pudo crear la suscripción",
-      details: err?.message || "Error desconocido",
-    });
+    res
+      .status(status >= 400 && status < 600 ? status : 500)
+      .json({
+        error: "No se pudo crear la suscripción",
+        details: err?.message || "Error desconocido",
+      });
   }
 });
 
-/* =========================
-   Return desde MP (back_url)
-========================= */
+/* ----- Return desde MP (back_url) ----- */
 app.get("/return", async (req, res) => {
   try {
     const preapprovalId =
@@ -485,9 +496,7 @@ app.get("/return", async (req, res) => {
   }
 });
 
-/* =========================
-   Refrescar licencia (forzar estado y token)
-========================= */
+/* ----- Refrescar licencia (forzar estado y token) ----- */
 app.post("/license/refresh", auth, async (req, res) => {
   try {
     let lic = await License.findOne({ where: { userId: req.user.id } });
@@ -528,9 +537,7 @@ app.post("/license/refresh", auth, async (req, res) => {
   }
 });
 
-/* =========================
-   Webhook (preapproval)
-========================= */
+/* ----- Webhook (preapproval) ----- */
 app.post("/webhook", async (req, res) => {
   try {
     const type =
@@ -583,10 +590,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-/* =========================
-   Gestión suscripción (protegido)
-========================= */
-// Cancelar
+/* ----- Gestión suscripción (protegido) ----- */
 app.post("/subscription/cancel", auth, async (req, res) => {
   try {
     const lic = await License.findOne({ where: { userId: req.user.id } });
@@ -606,7 +610,6 @@ app.post("/subscription/cancel", auth, async (req, res) => {
   }
 });
 
-// Pausar
 app.post("/subscription/pause", auth, async (req, res) => {
   try {
     const lic = await License.findOne({ where: { userId: req.user.id } });
@@ -624,7 +627,6 @@ app.post("/subscription/pause", auth, async (req, res) => {
   }
 });
 
-// Reanudar
 app.post("/subscription/resume", auth, async (req, res) => {
   try {
     const lic = await License.findOne({ where: { userId: req.user.id } });
@@ -644,7 +646,6 @@ app.post("/subscription/resume", auth, async (req, res) => {
   }
 });
 
-// Cambiar medio de pago (re-vincular)
 app.post("/subscription/change-method", auth, async (req, res) => {
   try {
     const { mpEmail, plan } = req.body || {};
@@ -660,7 +661,6 @@ app.post("/subscription/change-method", auth, async (req, res) => {
     const amount = currentPlan === "multi" ? multi : single;
 
     const backUrl = computeMpBackUrl();
-
     const { init_point, mpPreapprovalId } = await createSubscriptionDirect({
       userId: user.id,
       plan: currentPlan,
@@ -670,7 +670,6 @@ app.post("/subscription/change-method", auth, async (req, res) => {
       amount,
     });
 
-    // No tocamos la suscripción anterior aún; el webhook hará el swap cuando la nueva esté authorized
     res.json({ init_point, mpPreapprovalId });
   } catch (err) {
     console.error(
@@ -684,10 +683,7 @@ app.post("/subscription/change-method", auth, async (req, res) => {
   }
 });
 
-/* =========================
-   Licenciamiento offline (JWS) - público
-========================= */
-// Clave pública para verificación offline
+/* ----- Licenciamiento offline (JWS) - público ----- */
 app.get("/.well-known/venta-simple-license-pubkey", (_, res) => {
   try {
     const pem = getPublicKeyPem();
@@ -698,7 +694,6 @@ app.get("/.well-known/venta-simple-license-pubkey", (_, res) => {
   }
 });
 
-// Validar token + deviceId, vincular si hay cupo y emitir JWS
 app.post("/public/license/validate", async (req, res) => {
   try {
     const { token, deviceId } = req.body || {};
@@ -707,14 +702,12 @@ app.post("/public/license/validate", async (req, res) => {
 
     const lic = await License.findOne({ where: { token } });
     if (!lic) return res.status(404).json({ error: "Licencia no encontrada" });
-
     if (lic.status !== "active")
       return res
         .status(403)
         .json({ error: `Licencia no activa (${lic.status})` });
-    if (lic.expiresAt && new Date(lic.expiresAt).getTime() < Date.now()) {
+    if (lic.expiresAt && new Date(lic.expiresAt).getTime() < Date.now())
       return res.status(403).json({ error: "Licencia expirada" });
-    }
 
     const max = limitForPlan(lic.plan);
     const set = new Set(lic.devices || []);
@@ -762,7 +755,6 @@ app.post("/public/license/validate", async (req, res) => {
   }
 });
 
-// Refrescar JWS (mismo token + deviceId ya vinculado)
 app.post("/public/license/refresh", async (req, res) => {
   try {
     const { token, deviceId } = req.body || {};
@@ -775,14 +767,12 @@ app.post("/public/license/refresh", async (req, res) => {
       return res
         .status(403)
         .json({ error: `Licencia no activa (${lic.status})` });
-    if (lic.expiresAt && new Date(lic.expiresAt).getTime() < Date.now()) {
+    if (lic.expiresAt && new Date(lic.expiresAt).getTime() < Date.now())
       return res.status(403).json({ error: "Licencia expirada" });
-    }
-    if (!Array.isArray(lic.devices) || !lic.devices.includes(deviceId)) {
+    if (!Array.isArray(lic.devices) || !lic.devices.includes(deviceId))
       return res
         .status(403)
         .json({ error: "Este dispositivo no está vinculado a la licencia" });
-    }
 
     const features = {
       sync: true,
@@ -819,35 +809,27 @@ app.post("/public/license/refresh", async (req, res) => {
   }
 });
 
-/* =========================
-   Serie temporal de ventas (protegido)
-   GET /stats/sales-series?from=YYYY-MM-DD&to=YYYY-MM-DD&bucket=day|week|month
-========================= */
+/* ----- Serie temporal (protegido) ----- */
 app.get("/stats/sales-series", auth, async (req, res) => {
   try {
-    // Parámetros
     const from = String(req.query.from || "").slice(0, 10);
-    const to   = String(req.query.to || "").slice(0, 10);
-    const bucket = String(req.query.bucket || "day").toLowerCase(); // day|week|month
+    const to = String(req.query.to || "").slice(0, 10);
+    const bucket = String(req.query.bucket || "day").toLowerCase();
+    if (!from || !to)
+      return res
+        .status(400)
+        .json({ error: "from y to son requeridos (YYYY-MM-DD)" });
+    if (!["day", "week", "month"].includes(bucket))
+      return res.status(400).json({ error: "bucket inválido" });
 
-    if (!from || !to) return res.status(400).json({ error: "from y to son requeridos (YYYY-MM-DD)" });
-    if (!["day","week","month"].includes(bucket)) return res.status(400).json({ error: "bucket inválido" });
+    const SALES_TABLE = process.env.SALES_TABLE || "Venta";
+    const CREATED_AT = process.env.SALES_CREATED_AT || "createdAt";
+    const AMOUNT_COL = process.env.SALES_AMOUNT_COL || "total";
+    const USER_COL = process.env.SALES_USER_COL || "userId";
 
-    // Permitir override por ENV si tu esquema no usa los nombres por defecto
-    const SALES_TABLE = process.env.SALES_TABLE || "Venta";         // "Venta" | "ventas" | etc.
-    const CREATED_AT  = process.env.SALES_CREATED_AT || "createdAt";// fecha de la venta (utc)
-    const AMOUNT_COL  = process.env.SALES_AMOUNT_COL || "total";    // monto de la venta
-    const USER_COL    = process.env.SALES_USER_COL || "userId";     // si no existe, se reintenta sin filtro
-
-    // Normalizamos a rangos de tiempo en UTC (inclusive start, exclusive end)
-    // toExclusive = (to + 1 día) para incluir el día "to" completo
     const toExclusive = new Date(to + "T00:00:00Z");
     toExclusive.setUTCDate(toExclusive.getUTCDate() + 1);
 
-    // date_trunc bucket
-    const bucketSql = bucket; // Postgres: 'day' | 'week' | 'month'
-
-    // Intento 1: con filtro por usuario (multi-tenant)
     const sqlBase = `
       SELECT
         date_trunc(:bucket, "${SALES_TABLE}"."${CREATED_AT}") AS ts_bucket,
@@ -874,7 +856,7 @@ app.get("/stats/sales-series", auth, async (req, res) => {
     `;
 
     const replacements = {
-      bucket: bucketSql,
+      bucket,
       fromTs: new Date(from + "T00:00:00Z"),
       toTs: toExclusive,
       uid: req.user.id,
@@ -882,15 +864,19 @@ app.get("/stats/sales-series", auth, async (req, res) => {
 
     let rows;
     try {
-      rows = await sequelize.query(sqlBase, { type: sequelize.QueryTypes.SELECT, replacements });
-    } catch (e) {
-      // Si falla (columna userId no existe), reintenta sin filtro
-      rows = await sequelize.query(sqlNoUser, { type: sequelize.QueryTypes.SELECT, replacements });
+      rows = await sequelize.query(sqlBase, {
+        type: sequelize.QueryTypes.SELECT,
+        replacements,
+      });
+    } catch {
+      rows = await sequelize.query(sqlNoUser, {
+        type: sequelize.QueryTypes.SELECT,
+        replacements,
+      });
     }
 
-    // Normalizamos respuesta (ISO date, números)
-    const data = rows.map(r => ({
-      ts: new Date(r.ts_bucket).toISOString(),  // inicio del bucket en UTC
+    const data = rows.map((r) => ({
+      ts: new Date(r.ts_bucket).toISOString(),
       amount: Number(r.amount || 0),
       tickets: Number(r.tickets || 0),
     }));
@@ -902,18 +888,14 @@ app.get("/stats/sales-series", auth, async (req, res) => {
   }
 });
 
-
-/* =========================
-   Endpoints de estado (para Desktop)
-========================= */
+/* ----- Endpoints Desktop (status) ----- */
 if (SYNC_ENABLED) {
   console.log("[sync] habilitado (SYNC_API_ENABLED=1)");
-  // status por token: /desktop/license/status?licenseKey=VS-xxxx
-  // también expone aliases que ya está llamando el desktop
   const statusHandler = async (req, res) => {
     try {
       const licenseKey = String(req.query.licenseKey || "").trim();
-      if (!licenseKey) return res.status(400).json({ error: "licenseKey requerido" });
+      if (!licenseKey)
+        return res.status(400).json({ error: "licenseKey requerido" });
 
       const lic = await License.findOne({ where: { token: licenseKey } });
       if (!lic) return res.status(404).json({ error: "Not found" });
@@ -925,17 +907,16 @@ if (SYNC_ENABLED) {
       return res.status(500).json({ error: "Error interno" });
     }
   };
-
   app.get("/desktop/license/status", statusHandler);
   app.get("/subscription/status", statusHandler);
   app.get("/license/status", statusHandler);
 } else {
-  console.log("[sync] deshabilitado (define SYNC_API_ENABLED=1 para habilitar)");
+  console.log(
+    "[sync] deshabilitado (define SYNC_API_ENABLED=1 para habilitar)"
+  );
 }
 
-/* =========================
-   404 & start
-========================= */
+/* ----- 404 & start ----- */
 app.use((_, res) => res.status(404).json({ error: "Not found" }));
 
 app.listen(PORT, () => console.log(`Server listo en :${PORT}`));
