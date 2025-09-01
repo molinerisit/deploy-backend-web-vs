@@ -52,17 +52,19 @@ if (!MP_ACCESS_TOKEN) {
 }
 
 /* =========================
-   CORS (Vercel + whitelist env)
+   CORS (robusto: limpia comillas, rutas, barras)
 ========================= */
-function originOf(urlOrOrigin) {
+function normalizeOrigin(input) {
+  if (!input) return null;
+  const s = String(input).trim().replace(/["']/g, ""); // quita comillas pegadas
   try {
-    const u = new URL(urlOrOrigin);
+    // si viene una URL completa → tomamos origin
+    const u = new URL(s);
     return u.origin;
   } catch {
     try {
-      const u2 = new URL(
-        urlOrOrigin.includes("://") ? urlOrOrigin : `https://${urlOrOrigin}`
-      );
+      // si viene "dominio.tld" → asumimos https
+      const u2 = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
       return u2.origin;
     } catch {
       return null;
@@ -71,14 +73,12 @@ function originOf(urlOrOrigin) {
 }
 
 const envOrigins = (process.env.ALLOW_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean)
-  .map(originOf)
+  .split(/[,\n\r]+/) // admite coma o salto de línea
+  .map((v) => normalizeOrigin(v))
   .filter(Boolean);
 
 // origin del FRONTEND_URL principal
-const frontendOrigin = originOf(FRONTEND_URL);
+const frontendOrigin = normalizeOrigin(FRONTEND_URL);
 
 // dominio prod fijo de vercel (ajustá si cambia)
 const vercelProd =
@@ -87,20 +87,22 @@ const vercelProd =
 const vercelPreviewRe =
   /^https:\/\/deploy-frontend-web-vs-goou-[a-z0-9-]+\.vercel\.app$/;
 
+// Debug útil al boot
+console.log("[CORS] vercelProd =", vercelProd);
+console.log("[CORS] envOrigins =", envOrigins);
+
 const corsOptions = {
   origin(origin, cb) {
-    // sin origin (curl/SSR/health) -> permitir
+    // sin Origin (curl/health/SSR) → permitir
     if (!origin) return cb(null, true);
 
+    const o = normalizeOrigin(origin);
     const allowed =
-      origin === vercelProd ||
-      vercelPreviewRe.test(origin) ||
-      envOrigins.includes(origin);
+      o === vercelProd || vercelPreviewRe.test(o) || envOrigins.includes(o);
 
     if (allowed) return cb(null, true);
-
     console.warn("[CORS] Bloqueado origin:", origin);
-    cb(new Error("Not allowed by CORS"));
+    return cb(new Error("Not allowed by CORS"));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -113,17 +115,27 @@ const corsOptions = {
   ],
 };
 
-// Middlewares base
+/* =========================
+   Middlewares base (CORS antes de rutas)
+========================= */
 app.set("trust proxy", 1);
 app.use(helmet());
+
+// Rate limit (no cuentes preflight)
+const limiter = rateLimit({
+  windowMs: 60_000,
+  max: 200,
+  skip: (req) => req.method === "OPTIONS",
+});
+app.use(limiter);
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan("dev"));
-app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
-// CORS (debe ir después de body parsers para responder preflight en todas)
-app.use(cors(corsOptions));
+// CORS global + preflight universal
 app.options("*", cors(corsOptions));
+app.use(cors(corsOptions));
 
 /* =========================
    MP + DB
@@ -234,7 +246,6 @@ function htmlRedirect(targetUrl) {
    Rutas
 ========================= */
 app.use("/stats", buildStatsRouter());
-
 registerSyncRoutes(app);
 
 const auth = authMiddleware();
@@ -920,3 +931,10 @@ if (SYNC_ENABLED) {
 app.use((_, res) => res.status(404).json({ error: "Not found" }));
 
 app.listen(PORT, () => console.log(`Server listo en :${PORT}`));
+
+/* =========================
+   Nota rápida:
+   - Railway: FRONTEND_URL y ALLOW_ORIGINS deben ser orígenes puros,
+     sin comillas ni rutas, separados por coma.
+   - Vercel: usá solo VITE_API_URL en el frontend y apuntá al backend.
+========================= */
